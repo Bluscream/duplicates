@@ -1,0 +1,13 @@
+/target
+Cargo.lock
+duplicates.log
+duplicates.hashes.csv
+test_rust/
+test_sh_final/
+tmp_cross_test/
+*.exe
+*.o
+*.a
+*.so
+*.dylib
+*.pdb
