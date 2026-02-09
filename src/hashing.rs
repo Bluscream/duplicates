@@ -7,6 +7,28 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+pub fn validate_hash(hash: &str, algo: Algorithm) -> bool {
+    if hash.is_empty() {
+        return false;
+    }
+
+    // Check if hash contains only valid hex characters
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+
+    // Validate length based on algorithm
+    let expected_len = match algo {
+        Algorithm::Md5 => 32,
+        Algorithm::Sha256 => 64,
+        Algorithm::Sha512 => 128,
+        Algorithm::Crc32 => 8,
+        _ => return true, // Name and Size don't use hashes
+    };
+
+    hash.len() == expected_len
+}
+
 pub fn calculate_hash(path: &Path, algo: Algorithm) -> Result<String> {
     let mut file = File::open(path)?;
     let mut buffer = [0; 8192];

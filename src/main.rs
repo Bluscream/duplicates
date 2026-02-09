@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use sysinfo::Disks;
 use walkdir::WalkDir;
 
-use crate::hashing::calculate_hash;
+use crate::hashing::{calculate_hash, validate_hash};
 use crate::models::{Algorithm, Args, FileInfo, HashEntry, KeepCriteria, Mode};
 use crate::platform::{create_symlink, get_file_index};
 use crate::utils::{format_disk_info, get_raw_disk_info};
@@ -136,27 +136,6 @@ fn main() -> Result<()> {
     }
     log!("Unique files to process: {}", unique_files.len());
 
-    // 3. Load Cache
-    let mut cache: HashMap<String, String> = HashMap::new();
-    if cache_file_path.exists() {
-        log!("Loading cache...");
-        let mut rdr = csv::ReaderBuilder::new()
-            .delimiter(b';')
-            .from_path(&cache_file_path)?;
-        for result in rdr.deserialize() {
-            let entry: HashEntry = match result {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            // Key: path|size|time|algo
-            let key = format!(
-                "{}|{}|{}|{:?}",
-                entry.path, entry.size, entry.time, entry.algo
-            );
-            cache.insert(key, entry.hash);
-        }
-    }
-
     // 4. Hashing
     let groups = if args.algorithm == Algorithm::Name {
         let mut groups: HashMap<String, Vec<FileInfo>> = HashMap::new();
@@ -181,69 +160,119 @@ fn main() -> Result<()> {
             .map(|v| (v[0].size.to_string(), v))
             .collect()
     } else {
+        // 3. Load Cache AFTER file discovery
+        let mut cache: HashMap<String, String> = HashMap::new();
+        let mut cache_hits = 0;
+        if cache_file_path.exists() {
+            log!("Loading cache...");
+            let mut rdr = csv::ReaderBuilder::new()
+                .delimiter(b';')
+                .from_path(&cache_file_path)?;
+            for result in rdr.deserialize() {
+                let entry: HashEntry = match result {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                // Validate hash before adding to cache
+                if !validate_hash(&entry.hash, entry.algo) {
+                    continue;
+                }
+                let key = format!(
+                    "{}|{}|{}|{:?}",
+                    entry.path, entry.size, entry.time, entry.algo
+                );
+                cache.insert(key, entry.hash);
+            }
+        }
+
         log!("Pre-grouping by size...");
         let mut size_groups: HashMap<u64, Vec<FileInfo>> = HashMap::new();
         for f in unique_files {
             size_groups.entry(f.size).or_default().push(f);
         }
-        let candidates: Vec<FileInfo> = size_groups
+        let all_candidates: Vec<FileInfo> = size_groups
             .into_values()
             .filter(|v| v.len() > 1)
             .flatten()
             .collect();
 
-        log!("Hashing {} candidates...", candidates.len());
-        let pb = ProgressBar::new(candidates.len() as u64);
+        // 4. Separate cached from uncached files
+        let mut cached_files: Vec<(FileInfo, String)> = Vec::new();
+        let mut files_to_hash: Vec<FileInfo> = Vec::new();
+
+        for f in all_candidates {
+            let key = format!("{}|{}|{}|{:?}", f.rel_path, f.size, f.mtime, args.algorithm);
+            if let Some(hash) = cache.get(&key) {
+                cached_files.push((f, hash.clone()));
+                cache_hits += 1;
+            } else {
+                files_to_hash.push(f);
+            }
+        }
+
+        log!(
+            "Cache: {} hits, {} files need hashing",
+            cache_hits,
+            files_to_hash.len()
+        );
+
+        // 5. Open CSV for live appending
+        let csv_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cache_file_path)?;
+        let needs_header = !cache_file_path.exists() || fs::metadata(&cache_file_path)?.len() == 0;
+        let csv_writer = std::sync::Arc::new(std::sync::Mutex::new(
+            csv::WriterBuilder::new()
+                .delimiter(b';')
+                .has_headers(needs_header)
+                .from_writer(csv_file),
+        ));
+
+        // 6. Hash files with live CSV appending
+        let pb = ProgressBar::new(files_to_hash.len() as u64);
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
             .progress_chars("#>-"));
 
-        let hashed_results: Vec<(FileInfo, String)> = candidates
+        let algo = args.algorithm;
+        let newly_hashed: Vec<(FileInfo, String)> = files_to_hash
             .into_par_iter()
-            .map(|f| {
-                let key = format!("{}|{}|{}|{:?}", f.rel_path, f.size, f.mtime, args.algorithm);
-                let hash = if let Some(h) = cache.get(&key) {
-                    h.clone()
-                } else {
-                    calculate_hash(&f.path, args.algorithm).unwrap_or_else(|_| String::new())
+            .filter_map(|f| {
+                let hash = calculate_hash(&f.path, algo).unwrap_or_else(|_| String::new());
+                
+                // Validate hash before using it
+                if !validate_hash(&hash, algo) {
+                    pb.inc(1);
+                    return None;
+                }
+
+                // Live append to CSV
+                let entry = HashEntry {
+                    path: f.rel_path.clone(),
+                    size: f.size,
+                    time: f.mtime,
+                    algo,
+                    hash: hash.clone(),
                 };
+
+                if let Ok(mut wtr) = csv_writer.lock() {
+                    let _ = wtr.serialize(&entry);
+                    let _ = wtr.flush();
+                }
+
                 pb.inc(1);
-                (f, hash)
+                Some((f, hash))
             })
             .collect();
         pb.finish_and_clear();
 
-        let mut new_entries = Vec::new();
-        for (f, h) in &hashed_results {
-            let key = format!("{}|{}|{}|{:?}", f.rel_path, f.size, f.mtime, args.algorithm);
-            if !cache.contains_key(&key) {
-                new_entries.push(HashEntry {
-                    path: f.rel_path.clone(),
-                    size: f.size,
-                    time: f.mtime,
-                    algo: args.algorithm,
-                    hash: h.clone(),
-                });
-            }
-        }
-
-        if !new_entries.is_empty() {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&cache_file_path)?;
-            let mut wtr = csv::WriterBuilder::new()
-                .delimiter(b';')
-                .has_headers(!cache_file_path.exists() || fs::metadata(&cache_file_path)?.len() == 0)
-                .from_writer(file);
-            for entry in new_entries {
-                wtr.serialize(entry)?;
-            }
-            wtr.flush()?;
-        }
+        // 7. Combine cached and newly hashed results
+        let mut all_hashed = cached_files;
+        all_hashed.extend(newly_hashed);
 
         let mut groups: HashMap<String, Vec<FileInfo>> = HashMap::new();
-        for (f, h) in hashed_results {
+        for (f, h) in all_hashed {
             if !h.is_empty() {
                 groups.entry(h).or_default().push(f);
             }
