@@ -19,6 +19,49 @@ use crate::models::{Algorithm, Args, FileInfo, HashEntry, KeepCriteria, Mode};
 use crate::platform::{create_symlink, get_file_index};
 use crate::utils::{format_disk_info, get_raw_disk_info};
 
+fn load_hash_csv(
+    csv_path: &std::path::Path,
+    base_path: &std::path::Path,
+    cache: &mut HashMap<String, String>,
+) -> usize {
+    let mut loaded = 0;
+    if let Ok(mut rdr) = csv::ReaderBuilder::new()
+        .delimiter(b';')
+        .from_path(csv_path)
+    {
+        // Get the directory containing the CSV file
+        let csv_dir = csv_path.parent().unwrap_or(base_path);
+        
+        for result in rdr.deserialize() {
+            if let Ok(entry) = result {
+                let entry: HashEntry = entry;
+                // Validate hash before adding to cache
+                if validate_hash(&entry.hash, entry.algo) {
+                    // Adjust path relative to the CSV's location
+                    let adjusted_path = if entry.path.starts_with('/') || entry.path.starts_with('\\') {
+                        entry.path.clone()
+                    } else {
+                        csv_dir
+                            .join(&entry.path)
+                            .strip_prefix(base_path)
+                            .unwrap_or(std::path::Path::new(&entry.path))
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    
+                    let key = format!(
+                        "{}|{}|{}|{:?}",
+                        adjusted_path, entry.size, entry.time, entry.algo
+                    );
+                    cache.insert(key, entry.hash);
+                    loaded += 1;
+                }
+            }
+        }
+    }
+    loaded
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -59,9 +102,10 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "Unknown".to_string())
     );
 
-    // 1. Discovery
+    // 1. Discovery with hash CSV loading
     log!("Scanning directory...");
     let mut files = Vec::new();
+    let mut hash_csv_files = Vec::new();
     let ignores: HashSet<&str> = args.ignore.split(',').collect();
 
     let walker = WalkDir::new(&abs_path)
@@ -69,9 +113,7 @@ fn main() -> Result<()> {
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !ignores.contains(name.as_ref())
-                && name != "duplicates.log"
-                && name != "duplicates.hashes.csv"
+            !ignores.contains(name.as_ref()) && name != "duplicates.log"
         });
 
     let pb = ProgressBar::new_spinner();
@@ -95,6 +137,12 @@ fn main() -> Result<()> {
         }
 
         let path = entry.path().to_path_buf();
+        
+        // Check if this is a hash CSV file
+        if path.file_name().and_then(|n| n.to_str()) == Some("duplicates.hashes.csv") {
+            hash_csv_files.push(path);
+            continue;
+        }
         let metadata = match fs::metadata(&path) {
             Ok(m) => m,
             Err(_) => continue,
@@ -121,6 +169,20 @@ fn main() -> Result<()> {
     }
     pb.finish_and_clear();
     log!("Found {} total files in {} folders.", files.len(), folder_count);
+
+    // Load all discovered hash CSV files
+    let mut cache: HashMap<String, String> = HashMap::new();
+    if !hash_csv_files.is_empty() {
+        log!("Loading {} hash CSV file(s)...", hash_csv_files.len());
+        let mut total_loaded = 0;
+        for csv_path in &hash_csv_files {
+            let loaded = load_hash_csv(csv_path, &abs_path, &mut cache);
+            total_loaded += loaded;
+        }
+        if total_loaded > 0 {
+            log!("Loaded {} cached hashes from {} file(s)", total_loaded, hash_csv_files.len());
+        }
+    }
 
     // 2. Filter hardlinks
     log!("Filtering hardlinks...");
@@ -160,30 +222,8 @@ fn main() -> Result<()> {
             .map(|v| (v[0].size.to_string(), v))
             .collect()
     } else {
-        // 3. Load Cache AFTER file discovery
-        let mut cache: HashMap<String, String> = HashMap::new();
+        // Use the cache loaded during discovery
         let mut cache_hits = 0;
-        if cache_file_path.exists() {
-            log!("Loading cache...");
-            let mut rdr = csv::ReaderBuilder::new()
-                .delimiter(b';')
-                .from_path(&cache_file_path)?;
-            for result in rdr.deserialize() {
-                let entry: HashEntry = match result {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                // Validate hash before adding to cache
-                if !validate_hash(&entry.hash, entry.algo) {
-                    continue;
-                }
-                let key = format!(
-                    "{}|{}|{}|{:?}",
-                    entry.path, entry.size, entry.time, entry.algo
-                );
-                cache.insert(key, entry.hash);
-            }
-        }
 
         log!("Pre-grouping by size...");
         let mut size_groups: HashMap<u64, Vec<FileInfo>> = HashMap::new();
