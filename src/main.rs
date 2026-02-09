@@ -1,3 +1,4 @@
+mod cache;
 mod hashing;
 mod models;
 mod platform;
@@ -14,53 +15,12 @@ use std::time::UNIX_EPOCH;
 use sysinfo::Disks;
 use walkdir::WalkDir;
 
-use crate::hashing::{calculate_hash, validate_hash};
+use crate::cache::HashCache;
+use crate::hashing::calculate_hash;
 use crate::models::{Algorithm, Args, FileInfo, HashEntry, KeepCriteria, Mode};
 use crate::platform::{create_symlink, get_file_index};
 use crate::utils::{format_disk_info, get_raw_disk_info};
 
-fn load_hash_csv(
-    csv_path: &std::path::Path,
-    base_path: &std::path::Path,
-    cache: &mut HashMap<String, String>,
-) -> usize {
-    let mut loaded = 0;
-    if let Ok(mut rdr) = csv::ReaderBuilder::new()
-        .delimiter(b';')
-        .from_path(csv_path)
-    {
-        // Get the directory containing the CSV file
-        let csv_dir = csv_path.parent().unwrap_or(base_path);
-        
-        for result in rdr.deserialize() {
-            if let Ok(entry) = result {
-                let entry: HashEntry = entry;
-                // Validate hash before adding to cache
-                if validate_hash(&entry.hash, entry.algo) {
-                    // Adjust path relative to the CSV's location
-                    let adjusted_path = if entry.path.starts_with('/') || entry.path.starts_with('\\') {
-                        entry.path.clone()
-                    } else {
-                        csv_dir
-                            .join(&entry.path)
-                            .strip_prefix(base_path)
-                            .unwrap_or(std::path::Path::new(&entry.path))
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    
-                    let key = format!(
-                        "{}|{}|{}|{:?}",
-                        adjusted_path, entry.size, entry.time, entry.algo
-                    );
-                    cache.insert(key, entry.hash);
-                    loaded += 1;
-                }
-            }
-        }
-    }
-    loaded
-}
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -171,13 +131,14 @@ fn main() -> Result<()> {
     log!("Found {} total files in {} folders.", files.len(), folder_count);
 
     // Load all discovered hash CSV files
-    let mut cache: HashMap<String, String> = HashMap::new();
+    let mut hash_cache = HashCache::new(cache_file_path.clone(), abs_path.clone());
     if !hash_csv_files.is_empty() {
         log!("Loading {} hash CSV file(s)...", hash_csv_files.len());
         let mut total_loaded = 0;
         for csv_path in &hash_csv_files {
-            let loaded = load_hash_csv(csv_path, &abs_path, &mut cache);
-            total_loaded += loaded;
+            if let Ok(loaded) = hash_cache.load_csv(csv_path) {
+                total_loaded += loaded;
+            }
         }
         if total_loaded > 0 {
             log!("Loaded {} cached hashes from {} file(s)", total_loaded, hash_csv_files.len());
@@ -241,8 +202,7 @@ fn main() -> Result<()> {
         let mut files_to_hash: Vec<FileInfo> = Vec::new();
 
         for f in all_candidates {
-            let key = format!("{}|{}|{}|{:?}", f.rel_path, f.size, f.mtime, args.algorithm);
-            if let Some(hash) = cache.get(&key) {
+            if let Some(hash) = hash_cache.get(&f.rel_path, f.size, f.mtime, args.algorithm) {
                 cached_files.push((f, hash.clone()));
                 cache_hits += 1;
             } else {
@@ -262,20 +222,7 @@ fn main() -> Result<()> {
             total_bytes as f64 / 1_073_741_824.0
         );
 
-        // 5. Open CSV for live appending
-        let csv_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&cache_file_path)?;
-        let needs_header = !cache_file_path.exists() || fs::metadata(&cache_file_path)?.len() == 0;
-        let csv_writer = std::sync::Arc::new(std::sync::Mutex::new(
-            csv::WriterBuilder::new()
-                .delimiter(b';')
-                .has_headers(needs_header)
-                .from_writer(csv_file),
-        ));
-
-        // 6. Hash files with live CSV appending (progress based on bytes)
+        // 5. Hash files with live CSV appending (progress based on bytes)
         let pb = ProgressBar::new(total_bytes);
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -283,18 +230,19 @@ fn main() -> Result<()> {
             .progress_chars("#>-"));
 
         let algo = args.algorithm;
+        let hash_cache_ref = std::sync::Arc::new(std::sync::Mutex::new(hash_cache));
         let newly_hashed: Vec<(FileInfo, String)> = files_to_hash
             .into_par_iter()
             .filter_map(|f| {
                 let hash = calculate_hash(&f.path, algo).unwrap_or_else(|_| String::new());
                 
                 // Validate hash before using it
-                if !validate_hash(&hash, algo) {
+                if !crate::hashing::validate_hash(&hash, algo) {
                     pb.inc(f.size);
                     return None;
                 }
 
-                // Live append to CSV
+                // Live append to CSV using HashCache
                 let entry = HashEntry {
                     path: f.rel_path.clone(),
                     size: f.size,
@@ -303,9 +251,8 @@ fn main() -> Result<()> {
                     hash: hash.clone(),
                 };
 
-                if let Ok(mut wtr) = csv_writer.lock() {
-                    let _ = wtr.serialize(&entry);
-                    let _ = wtr.flush();
+                if let Ok(cache) = hash_cache_ref.lock() {
+                    let _ = cache.append(&entry);
                 }
 
                 pb.inc(f.size);
