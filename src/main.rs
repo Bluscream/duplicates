@@ -21,6 +21,28 @@ use crate::models::{Algorithm, Args, FileInfo, HashEntry, KeepCriteria, Mode};
 use crate::platform::{create_symlink, get_file_index};
 use crate::utils::{format_disk_info, get_raw_disk_info};
 
+fn format_size(bytes: u64) -> String {
+    if bytes == u64::MAX {
+        return "∞".to_string();
+    }
+    const TB: u64 = 1024 * 1024 * 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    const KB: u64 = 1024;
+
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -158,6 +180,20 @@ fn main() -> Result<()> {
         unique_files.push(f);
     }
     log!("Unique files to process: {}", unique_files.len());
+
+    // 3. Filter by size
+    let before_size_filter = unique_files.len();
+    unique_files.retain(|f| f.size >= args.min_size && f.size <= args.max_size);
+    let filtered_count = before_size_filter - unique_files.len();
+    if filtered_count > 0 {
+        log!(
+            "Filtered {} files outside size range ({} - {})",
+            filtered_count,
+            format_size(args.min_size),
+            format_size(args.max_size)
+        );
+    }
+    log!("Files after size filter: {}", unique_files.len());
 
     // 4. Hashing
     let groups = if args.algorithm == Algorithm::Name {

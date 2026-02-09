@@ -56,6 +56,41 @@ pub struct Args {
 
     #[arg(short, long)]
     pub threads: Option<usize>,
+
+    #[arg(long, default_value = "1MB", value_parser = parse_size)]
+    pub min_size: u64,
+
+    #[arg(long, default_value = "1TB", value_parser = parse_size)]
+    pub max_size: u64,
+}
+
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    
+    // Handle -1 as infinite (u64::MAX)
+    if s == "-1" {
+        return Ok(u64::MAX);
+    }
+    
+    // Extract number and unit
+    let (num_str, unit) = if let Some(pos) = s.find(|c: char| c.is_alphabetic()) {
+        (&s[..pos], &s[pos..])
+    } else {
+        (s, "")
+    };
+    
+    let num: f64 = num_str.parse().map_err(|_| format!("Invalid number: {}", num_str))?;
+    
+    let multiplier = match unit.to_uppercase().as_str() {
+        "" | "B" => 1u64,
+        "KB" | "K" => 1024u64,
+        "MB" | "M" => 1024u64 * 1024,
+        "GB" | "G" => 1024u64 * 1024 * 1024,
+        "TB" | "T" => 1024u64 * 1024 * 1024 * 1024,
+        _ => return Err(format!("Unknown unit: {}. Use B, KB, MB, GB, or TB", unit)),
+    };
+    
+    Ok((num * multiplier as f64) as u64)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
